@@ -472,7 +472,7 @@ class ProtocolResponseHandler:
             # the table must hold this copy too. A radio copy is there already
             # (pre-dedup feed); one delivered in-process by a multi-identity
             # host is not, and an over-the-air echo would otherwise win.
-            self.return_path_teacher.seed_copy(pkt)
+            self.return_path_teacher.seed_copy(pkt, reciprocal_hash_key)
 
             # Build the reciprocal PATH packet.  create_path_return produces a
             # FLOOD PATH by default; we convert it to DIRECT below.
