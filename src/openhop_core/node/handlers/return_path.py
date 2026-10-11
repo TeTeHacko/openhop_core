@@ -218,6 +218,19 @@ RETURN_PATH_COPY_TTL_S = 8.0
 RETURN_PATH_COPY_CACHE_MAX = 128
 
 
+def _delivered_in_process(pkt: Packet) -> bool:
+    """True when the host handed us this copy in-process rather than over RF.
+
+    A host that runs several identities on one radio hands traffic between them
+    to the co-hosted addressee directly; the repeater's inject path marks that
+    very object ``_injected_for_tx`` before fanning it out. That copy is
+    zero-hop and loss-free, so no route heard over the air can beat it -- yet
+    its ``_rssi``/``_snr`` are 0, which would rank it as a weak radio copy. A
+    packet parsed off the radio never carries the marker.
+    """
+    return bool(getattr(pkt, "_injected_for_tx", False))
+
+
 class _FloodCopy:
     """The best-received copy of one flood reply, keyed by its packet hash.
 
@@ -429,6 +442,7 @@ class ReturnPathTeacher:
             in_len_byte,
             int(getattr(pkt, "_rssi", 0) or 0),
             float(getattr(pkt, "_snr", 0) or 0),
+            in_process=_delivered_in_process(pkt),
         )
 
         return await self._teach(
@@ -443,6 +457,36 @@ class ReturnPathTeacher:
             hash_key=packet_hash,
             settle_s=self._settle_s,
         )
+
+    def seed_copy(self, pkt: Packet) -> None:
+        """Record the copy a caller is teaching from, so only a better one replaces it.
+
+        ``maybe_reteach_better_copy`` re-teaches whenever the best recorded copy
+        differs from the route it taught. That is only a *better* route if the
+        taught copy was itself in the table: the pre-dedup feed
+        (``note_flood_copy``) records every radio copy, but a copy the host
+        delivered in-process never passes the radio, so without this an echo of
+        our own flood -- relayed back by a nearby repeater -- was the sole entry
+        and re-taught a co-hosted peer a route through that repeater. Recording
+        the same radio copy twice is harmless (an equal rank keeps the entry).
+
+        Best-effort and never raises: the teach it refines has already gone out.
+        """
+        try:
+            len_byte = int(getattr(pkt, "path_len", 0) or 0)
+            path = self._validated_inbound_path(pkt, len_byte)
+            if path is None:
+                return
+            self._record_copy(
+                bytes(pkt.calculate_packet_hash()),
+                path,
+                len_byte,
+                int(getattr(pkt, "_rssi", 0) or 0),
+                float(getattr(pkt, "_snr", 0) or 0),
+                in_process=_delivered_in_process(pkt),
+            )
+        except Exception as e:
+            self._log(f"[ReturnPath] seed_copy ignored a packet: {e}")
 
     # ------------------------------------------------------------------
     # Refine a teach that was already sent from the first-arrived copy
@@ -696,6 +740,8 @@ class ReturnPathTeacher:
         len_byte: int,
         rssi: int,
         snr: float = 0.0,
+        *,
+        in_process: bool = False,
     ) -> None:
         """Keep the best-ranked copy of a flood reply, keyed by packet hash.
 
@@ -704,13 +750,26 @@ class ReturnPathTeacher:
         waterfall it is not a route, and teaching it would hand the peer a link
         that cannot carry its replies. Discarding leaves whatever the caller
         seeded (the first-arrived copy) as the fallback, so a teach is never lost.
+
+        ``in_process`` marks a copy the host delivered without RF (see
+        :func:`_delivered_in_process`). It has no last-hop measurement to rank by
+        and needs none: it gets a tier above every radio copy, so no relayed echo
+        of it can displace it.
         """
-        margin = self._copy_margin_db(rssi, snr)
-        if margin < self._min_margin_db:
-            return
+        if in_process:
+            margin = float("inf")
+            try:
+                hops = PathUtils.get_path_hash_count(len_byte)
+            except Exception:
+                hops = 0
+            rank: tuple = (2, -hops, margin, rssi)
+        else:
+            margin = self._copy_margin_db(rssi, snr)
+            if margin < self._min_margin_db:
+                return
+            rank = self._copy_rank(margin, len_byte, rssi)
         now = self._time()
         self._prune_copies(now)
-        rank = self._copy_rank(margin, len_byte, rssi)
         existing = self._recent_copies.get(packet_hash)
         if existing is not None and rank <= existing.rank:
             existing.ts = now  # refresh so the winning copy outlives the window
